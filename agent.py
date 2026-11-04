@@ -25,6 +25,52 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 
 import buy
+import guardrails
+
+# ANSI Color codes for terminal/video display
+class Color:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    GREEN = "\033[1;32m"
+    RED = "\033[1;31m"
+    YELLOW = "\033[1;33m"
+    CYAN = "\033[1;36m"
+    BRIGHT_GREEN = "\033[1;92m"
+
+
+# Colored status words for video-friendly output
+STATUS_OK = f"{Color.GREEN}OK{Color.RESET}"
+STATUS_BLOCKED = f"{Color.RED}BLOCKED{Color.RESET}"
+STATUS_APPROVAL_NEEDED = f"{Color.YELLOW}APPROVAL NEEDED{Color.RESET}"
+STATUS_DELIVERED = f"{Color.BRIGHT_GREEN}DELIVERED{Color.RESET}"
+
+
+def mask_text(text: Any) -> str:
+    """Mask any phone numbers in string."""
+    if not text:
+        return ""
+    s = str(text)
+    # Mask Indian mobile numbers with +91: +919876543210 -> +91******3210
+    s = re.sub(r'(\+91)\d{6}(\d{4})', r'\1******\2', s)
+    # Mask standalone 10-digit Indian mobile numbers (starts with 6-9)
+    s = re.sub(r'(?<!\d)([6-9])\d{5}(\d{4})(?!\d)', r'\1*****\2', s)
+    return s
+
+
+def print_spending_banner() -> None:
+    """Display spending banner showing today's spend against limits."""
+    today_spent = guardrails.get_daily_spending()
+    max_day = guardrails.get_max_per_day()
+    max_purchase = guardrails.get_max_per_purchase()
+    remaining = max(0.0, max_day - today_spent)
+
+    print(f"\n{Color.CYAN}┌────────────────────────────────────────────────────────────────────────────────────────┐{Color.RESET}")
+    print(
+        f"{Color.CYAN}│{Color.RESET} {Color.BOLD}DAILY SPEND:{Color.RESET} ₹{today_spent:.2f} / ₹{max_day:.2f} INR  "
+        f"│  {Color.BOLD}REMAINING:{Color.RESET} ₹{remaining:.2f}  "
+        f"│  {Color.BOLD}TX CAP:{Color.RESET} ₹{max_purchase:.2f} INR {Color.CYAN}│{Color.RESET}"
+    )
+    print(f"{Color.CYAN}└────────────────────────────────────────────────────────────────────────────────────────┘{Color.RESET}\n")
 
 ALLOWED_PRODUCTS: List[str] = [
     "reliance-jio-india-bundles",
@@ -308,11 +354,16 @@ def print_masked_receipt(purchase_result: Dict[str, Any]) -> None:
 
 
 def ask_user_confirmation(parsed_req: Dict[str, str]) -> bool:
+    """Prompt user to confirm the parsed request before proceeding."""
+    product = parsed_req["product"]
+    value = parsed_req["value"]
+    recipient = mask_text(parsed_req["recipient"])
+
     print("\n" + "-" * 42)
     print("Parsed Purchase Request:")
-    print(f"  Product:   {parsed_req['product']}")
-    print(f"  Value:     {parsed_req['value']}")
-    print(f"  Recipient: {parsed_req['recipient']}")
+    print(f"  Product:   {product}")
+    print(f"  Value:     {value}")
+    print(f"  Recipient: {recipient}")
     print("-" * 42)
 
     while True:
@@ -330,10 +381,10 @@ def ask_user_confirmation(parsed_req: Dict[str, str]) -> bool:
 
 
 def run_agent_loop(dry_run: bool = False) -> None:
-    print("==================================================")
-    print("          Bitrefill AI Purchase Agent             ")
-    print("==================================================")
+    """Main interactive terminal loop for agent."""
+    print_spending_banner()
 
+    # 1. Load LLM credentials
     try:
         provider, api_key = get_llm_credentials()
         print(f"LLM Provider: {provider.upper()} (API key loaded successfully)")
@@ -341,6 +392,7 @@ def run_agent_loop(dry_run: bool = False) -> None:
         print(f"\nConfiguration Error: {exc}", file=sys.stderr)
         return
 
+    # 2. Check Bitrefill client connectivity
     bitrefill_client: Optional[buy.BitrefillClient] = None
     try:
         bf_key = buy.get_api_key()
@@ -351,7 +403,7 @@ def run_agent_loop(dry_run: bool = False) -> None:
     print("\nAvailable products:")
     for p in ALLOWED_PRODUCTS:
         print(f"  - {p}")
-    print("\nType your purchase request (e.g., 'Buy test card 10 for self' or 'Recharge Jio 10 on +919876543210').")
+    print("\nType your purchase request (e.g., 'Buy test card 10 for self' or 'Recharge Jio 10 on +91XXXXXXXXXX').")
     print("Type 'exit' or 'quit' to quit.\n")
 
     while True:
@@ -368,47 +420,55 @@ def run_agent_loop(dry_run: bool = False) -> None:
             print("Goodbye!")
             break
 
-        print("\n[Agent] Interpreting request with LLM...")
+        # Step 1: Parse Intent with LLM
         try:
             raw_llm_output = call_llm(provider, api_key, user_input)
-        except Exception as exc:
-            print(f"[Error] Failed to get response from LLM: {exc}")
-            continue
-
-        try:
             parsed_json = parse_llm_json(raw_llm_output)
-        except ValueError as err:
-            print(f"[Rejected] Invalid JSON returned by LLM: {err}")
+        except Exception as exc:
+            print(f"[1/4] Parse Intent:     {STATUS_BLOCKED}  (Error: {mask_text(str(exc))})")
             continue
 
+        raw_prod = parsed_json.get("product", "")
+        raw_val = parsed_json.get("value", "")
+        raw_recip = mask_text(parsed_json.get("recipient", ""))
+        print(f"[1/4] Parse Intent:     {STATUS_OK}  (Product: {raw_prod} | Value: {raw_val} | Recipient: {raw_recip})")
+
+        # Step 2: Plain Python Validation
         valid, err_msg, validated_req = validate_purchase_request(parsed_json, bitrefill_client)
         if not valid or validated_req is None:
-            print(f"[Rejected] Validation error: {err_msg}")
+            print(f"[2/4] Validation:       {STATUS_BLOCKED}  ({mask_text(err_msg)})")
             continue
 
+        print(f"[2/4] Validation:       {STATUS_OK}  (Allowlist, package value, recipient verified)")
+
+        # Ask user confirmation
         confirmed = ask_user_confirmation(validated_req)
         if not confirmed:
-            print("Purchase cancelled by user.")
+            print("[Cancelled] Purchase cancelled by user.\n")
             continue
 
+        # Prepare parameters for buy.py purchase flow
         product_id = validated_req["product"]
         package_value = validated_req["value"]
         recipient_phone = None if validated_req["recipient"] == "self" else validated_req["recipient"]
 
-        print("\n[Agent] Executing purchase flow with guardrails...")
+        # Step 3 (Guardrails) & Step 4 (Delivery) executed via buy.run_purchase_flow
         try:
             result = buy.run_purchase_flow(
                 product_id=product_id,
                 package_value=package_value,
                 recipient_phone=recipient_phone,
                 dry_run=dry_run,
+                verbose=False,
             )
             if result and isinstance(result, dict):
                 print_masked_receipt(result)
+                print_spending_banner()
             else:
-                print("\n[Agent] Purchase completed.")
-        except Exception as exc:
-            print(f"\n[Execution Error] {exc}", file=sys.stderr)
+                print_spending_banner()
+        except Exception:
+            # buy.py already printed colored guardrail status on failure
+            pass
 
 
 if __name__ == "__main__":
