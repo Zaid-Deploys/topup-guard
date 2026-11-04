@@ -18,6 +18,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 import requests
+import guardrails
 
 BASE_URL = "https://api.bitrefill.com/v2"
 PRODUCT_ID = "airtel-india"
@@ -212,6 +213,33 @@ def run_purchase_flow(
 
     print(f"\nTarget package selected: ID={selected_package_id}, Value={selected_value}")
 
+    phone = recipient_phone or os.getenv("RECIPIENT_PHONE")
+
+    # Determine amount in INR for guardrail verification
+    try:
+        amount_inr = float(selected_value) if selected_value is not None else float(package_value)
+    except (ValueError, TypeError):
+        amount_inr = 0.0
+
+    print("\n=== Checking Guardrails ===")
+    check_res = guardrails.check_purchase(
+        product=product_id,
+        amount_inr=amount_inr,
+        recipient=phone,
+    )
+    print(f"Guardrails Status: {check_res.status}")
+    print(f"Details: {check_res.reason}")
+
+    if check_res.status == "BLOCKED":
+        raise RuntimeError(f"Purchase blocked by guardrails: {check_res.reason}")
+
+    if check_res.status == "NEEDS_APPROVAL":
+        approved = guardrails.ask_approval(check_res.reason)
+        if not approved:
+            print("\nPurchase declined by user. Stopping.")
+            return
+        print("Purchase approved by user. Proceeding...")
+
     print("\n=== Step 3: Creating Invoice ===")
     order_item: Dict[str, Any] = {
         "product_id": product_id,
@@ -222,7 +250,6 @@ def run_purchase_flow(
     elif selected_value is not None:
         order_item["value"] = selected_value
 
-    phone = recipient_phone or os.getenv("RECIPIENT_PHONE")
     if phone:
         order_item["phone_number"] = phone
         print(f"Attached recipient phone: {mask_sensitive(phone)}")
@@ -317,6 +344,15 @@ def run_purchase_flow(
             print(f"Redemption Info: {mask_sensitive(redemption_info)}")
         else:
             print("Redemption Info: Delivered directly (no voucher code required).")
+
+    # Record purchase in ledger after delivery
+    ledger_entry = guardrails.record_purchase(
+        product=product_id,
+        amount_inr=amount_inr,
+        recipient=phone,
+        invoice_id=invoice_id,
+    )
+    print(f"\n[Guardrails] Purchase recorded in ledger: {ledger_entry['purchase_key']}")
 
 
 if __name__ == "__main__":
