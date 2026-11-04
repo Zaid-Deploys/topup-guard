@@ -24,11 +24,11 @@ class TestValidation:
         assert parsed == {'product': 'airtel-india', 'value': '500', 'recipient': '+919876543210'}
 
     def test_valid_jio_with_int_value(self):
-        req = {'product': 'reliance-jio-india-bundles', 'value': 10, 'recipient': '+919594427286'}
+        req = {'product': 'reliance-jio-india-bundles', 'value': 10, 'recipient': '+919123456789'}
         valid, err, parsed = agent.validate_purchase_request(req)
         assert valid is True
         assert err is None
-        assert parsed == {'product': 'reliance-jio-india-bundles', 'value': '10', 'recipient': '+919594427286'}
+        assert parsed == {'product': 'reliance-jio-india-bundles', 'value': '10', 'recipient': '+919123456789'}
 
     def test_reject_unknown_product(self):
         req = {'product': 'vodafone-india', 'value': '10', 'recipient': 'self'}
@@ -178,25 +178,86 @@ class TestSecurityConstraints:
         if bf_key:
             assert bf_key not in payload_str
 
+    @patch('requests.post')
+    def test_llm_never_receives_bitrefill_key_gemini(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.json.return_value = {
+            'candidates': [{
+                'content': {
+                    'parts': [{'text': '{"product": "test-gift-card-code", "value": "10", "recipient": "self"}'}]
+                }
+            }]
+        }
+        mock_post.return_value = mock_response
+
+        dummy_gemini_key = 'gemini-dummy-secret-key-9999'
+        agent.call_llm('gemini', dummy_gemini_key, 'Buy test gift card 10')
+
+        called_args, called_kwargs = mock_post.call_args
+        headers = called_kwargs.get('headers', {})
+        payload = called_kwargs.get('json', {})
+
+        # Verify x-goog-api-key header
+        assert headers['x-goog-api-key'] == dummy_gemini_key
+        # Verify no bitrefill key in payload
+        bf_key = os.getenv('BITREFILL_API_KEY', '')
+        if bf_key:
+            assert bf_key not in json.dumps(payload)
+
 
 class TestCredentials:
+    def test_get_llm_credentials_gemini(self):
+        with patch.dict(os.environ, {'GEMINI_API_KEY': 'AIzaSyTestGeminiKey', 'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': ''}):
+            with patch('buy.load_env_file', return_value={}):
+                provider, key = agent.get_llm_credentials()
+                assert provider == 'gemini'
+                assert key == 'AIzaSyTestGeminiKey'
+
+    def test_get_llm_credentials_priority_gemini_over_groq_and_openrouter(self):
+        with patch.dict(os.environ, {
+            'GEMINI_API_KEY': 'gemini_key_1',
+            'GROQ_API_KEY': 'groq_key_2',
+            'OPENROUTER_API_KEY': 'openrouter_key_3',
+        }):
+            with patch('buy.load_env_file', return_value={}):
+                provider, key = agent.get_llm_credentials()
+                assert provider == 'gemini'
+                assert key == 'gemini_key_1'
+
     def test_get_llm_credentials_groq(self):
-        with patch.dict(os.environ, {'GROQ_API_KEY': 'gsk_test123', 'OPENROUTER_API_KEY': ''}):
-            provider, key = agent.get_llm_credentials()
-            assert provider == 'groq'
-            assert key == 'gsk_test123'
+        with patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GROQ_API_KEY': 'gsk_test123', 'OPENROUTER_API_KEY': ''}):
+            with patch('buy.load_env_file', return_value={}):
+                provider, key = agent.get_llm_credentials()
+                assert provider == 'groq'
+                assert key == 'gsk_test123'
 
     def test_get_llm_credentials_openrouter(self):
-        with patch.dict(os.environ, {'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': 'sk-or-v1-test456'}):
-            provider, key = agent.get_llm_credentials()
-            assert provider == 'openrouter'
-            assert key == 'sk-or-v1-test456'
+        with patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': 'sk-or-v1-test456'}):
+            with patch('buy.load_env_file', return_value={}):
+                provider, key = agent.get_llm_credentials()
+                assert provider == 'openrouter'
+                assert key == 'sk-or-v1-test456'
 
     def test_get_llm_credentials_missing(self):
-        with patch.dict(os.environ, {'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': ''}):
+        with patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': ''}):
             with patch('buy.load_env_file', return_value={}):
-                with pytest.raises(RuntimeError, match='Neither GROQ_API_KEY nor OPENROUTER_API_KEY found'):
+                with pytest.raises(RuntimeError) as exc_info:
                     agent.get_llm_credentials()
+                msg = str(exc_info.value)
+                assert 'GEMINI_API_KEY' in msg
+                assert 'GROQ_API_KEY' in msg
+                assert 'OPENROUTER_API_KEY' in msg
+
+    def test_configuration_error_message(self, capsys):
+        with patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GROQ_API_KEY': '', 'OPENROUTER_API_KEY': ''}):
+            with patch('buy.load_env_file', return_value={}):
+                agent.run_agent_loop()
+                err = capsys.readouterr().err
+                assert 'Configuration Error:' in err
+                assert 'GEMINI_API_KEY' in err
+                assert 'GROQ_API_KEY' in err
+                assert 'OPENROUTER_API_KEY' in err
 
 
 class TestReceiptPrinting:
@@ -286,10 +347,10 @@ class TestVideoFormatting:
         # +91 followed by 10 digits
         assert agent.mask_text('+919876543210') == '+91******3210'
         # Embedded in reason string
-        reason = "Key 'reliance-jio-india-bundles:18.14:+919594427286:2026-11-04' completed"
+        reason = "Key 'reliance-jio-india-bundles:18.14:+919123456789:2026-11-04' completed"
         masked = agent.mask_text(reason)
-        assert '+91******7286' in masked
-        assert '959442' not in masked
+        assert '+91******6789' in masked
+        assert '912345' not in masked
         # Standalone 10 digit Indian number
         assert '9*****3210' in agent.mask_text('Call 9876543210 today')
 

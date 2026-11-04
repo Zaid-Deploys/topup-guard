@@ -25,7 +25,7 @@ User Prompt -> LLM Intent Extraction (JSON only) -> Plain Python Validation & Al
 ### Prerequisites
 - Python 3.10+ and Git
 - Funded Bitrefill account with API key
-- (Optional) Groq or OpenRouter API key for the conversational agent (`agent.py`)
+- (Optional) Gemini, Groq, or OpenRouter API key for the conversational agent (`agent.py`)
 
 ### Setup
 ```bash
@@ -34,7 +34,7 @@ cd topup-guard
 python3 -m venv .venv && source .venv/bin/activate
 pip install requests pytest
 cp .env.example .env
-# Edit .env and insert your BITREFILL_API_KEY (and optional GROQ_API_KEY)
+# Edit .env and insert your BITREFILL_API_KEY (and optional GEMINI_API_KEY / GROQ_API_KEY)
 ```
 
 ### Usage

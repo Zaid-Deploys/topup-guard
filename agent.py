@@ -3,7 +3,7 @@
 Agent Terminal Chat Loop for Bitrefill Purchases.
 
 Features:
-1. Loads GROQ_API_KEY or OPENROUTER_API_KEY from .env / environment (never prints keys).
+1. Loads GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY from .env / environment (never prints keys).
 2. Prompts LLM to extract purchase intent as strict JSON:
    {"product": "...", "value": "...", "recipient": "..."}
 3. Validates strictly in plain Python:
@@ -90,9 +90,11 @@ STATIC_PACKAGE_VALUES: Dict[str, Set[str]] = {
     },
 }
 
+GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
 
@@ -109,16 +111,21 @@ def get_llm_credentials() -> Tuple[str, str]:
         loaded = buy.load_env_file(path)
         loaded_env.update(loaded)
 
+    # Provider Priority: 1. Gemini, 2. Groq, 3. OpenRouter
+    gemini_key = os.getenv("GEMINI_API_KEY") or loaded_env.get("GEMINI_API_KEY")
+    if gemini_key and gemini_key.strip():
+        return "gemini", gemini_key.strip()
+
     groq_key = os.getenv("GROQ_API_KEY") or loaded_env.get("GROQ_API_KEY")
-    if groq_key:
+    if groq_key and groq_key.strip():
         return "groq", groq_key.strip()
 
     openrouter_key = os.getenv("OPENROUTER_API_KEY") or loaded_env.get("OPENROUTER_API_KEY")
-    if openrouter_key:
+    if openrouter_key and openrouter_key.strip():
         return "openrouter", openrouter_key.strip()
 
     raise RuntimeError(
-        "Neither GROQ_API_KEY nor OPENROUTER_API_KEY found. "
+        "No LLM API key found (GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY). "
         "Please configure one in your .env file or environment."
     )
 
@@ -251,6 +258,40 @@ def call_llm(
         "Do NOT return any commentary, markdown explanation, or text outside the JSON object."
     )
 
+    if provider == "gemini":
+        model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        url = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "contents": [
+                {"parts": [{"text": user_prompt}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "response_mime_type": "application/json",
+            },
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if not resp.ok:
+            safe_err = buy.mask_text(resp.text)
+            raise RuntimeError(f"Gemini API Error [{resp.status_code}]: {safe_err}")
+
+        data = resp.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini returned empty candidates list.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            raise RuntimeError("Gemini returned empty content parts.")
+        return parts[0].get("text", "").strip()
+
     if provider == "groq":
         url = GROQ_ENDPOINT
         model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
@@ -274,7 +315,8 @@ def call_llm(
 
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if not resp.ok:
-        raise RuntimeError(f"LLM API Error [{resp.status_code}]: {resp.text}")
+        safe_err = buy.mask_text(resp.text)
+        raise RuntimeError(f"LLM API Error [{resp.status_code}]: {safe_err}")
 
     data = resp.json()
     choices = data.get("choices", [])
@@ -389,7 +431,11 @@ def run_agent_loop(dry_run: bool = False) -> None:
         provider, api_key = get_llm_credentials()
         print(f"LLM Provider: {provider.upper()} (API key loaded successfully)")
     except Exception as exc:
-        print(f"\nConfiguration Error: {exc}", file=sys.stderr)
+        print(
+            f"\nConfiguration Error: {exc}\n"
+            "Supported LLM providers: GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY.",
+            file=sys.stderr,
+        )
         return
 
     # 2. Check Bitrefill client connectivity
