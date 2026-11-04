@@ -14,6 +14,7 @@ Flow:
 
 import argparse
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -80,6 +81,80 @@ def mask_sensitive(value: Optional[str]) -> str:
         return "*" * len(val_str)
     # Mask all characters except the first 2 and last 2
     return f"{val_str[:2]}{'*' * (len(val_str) - 4)}{val_str[-2:]}"
+
+
+def is_plain_number(val: Any) -> bool:
+    """Check if value is a plain numeric string or number."""
+    if val is None:
+        return False
+    s = str(val).strip()
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_rupee_amount(text: Optional[str]) -> Optional[float]:
+    """Parse rupee amount from strings like '₹7.47 Talktime Top-Up'."""
+    if not text:
+        return None
+    match = re.search(r'[₹|Rs\.?|INR]\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', str(text), re.IGNORECASE)
+    if match:
+        raw_num = match.group(1).replace(",", "")
+        try:
+            val = float(raw_num)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def get_sats_per_inr_rate(product_details: Optional[Dict[str, Any]]) -> float:
+    """Derive sats-per-INR exchange rate from available packages in product."""
+    if product_details:
+        packages = product_details.get("packages", [])
+        rates: List[float] = []
+        for p in packages:
+            amt = p.get("amount")
+            prc = p.get("price")
+            if amt is None:
+                amt = parse_rupee_amount(str(p.get("value", ""))) or parse_rupee_amount(str(p.get("name", "")))
+            try:
+                amt_f = float(amt)
+                prc_f = float(prc)
+                if amt_f > 0 and prc_f > 0:
+                    rates.append(prc_f / amt_f)
+            except (ValueError, TypeError):
+                continue
+        if rates:
+            return sum(rates) / len(rates)
+    return 14.03
+
+
+def convert_sats_to_inr(
+    price_sats: float,
+    package: Optional[Dict[str, Any]] = None,
+    product_details: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Convert sats to INR using package price/amount or product rate."""
+    sats = float(price_sats)
+    if package:
+        pkg_amt = package.get("amount")
+        pkg_prc = package.get("price")
+        if pkg_amt and pkg_prc:
+            try:
+                amt_f = float(pkg_amt)
+                prc_f = float(pkg_prc)
+                if amt_f > 0 and prc_f > 0:
+                    rate = prc_f / amt_f
+                    return round(sats / rate, 2)
+            except (ValueError, TypeError):
+                pass
+
+    rate = get_sats_per_inr_rate(product_details)
+    return round(sats / rate, 2)
 
 
 class BitrefillClient:
@@ -185,6 +260,7 @@ def run_purchase_flow(
 
     selected_package_id = None
     selected_value = None
+    selected_package: Optional[Dict[str, Any]] = None
 
     if packages:
         print(f"Available Packages ({len(packages)} total):")
@@ -198,6 +274,7 @@ def run_purchase_flow(
             if val == str(package_value) and selected_package_id is None:
                 selected_package_id = pkg_id
                 selected_value = pkg.get("value")
+                selected_package = pkg
 
     if not selected_package_id and range_info:
         print(f"Product offers a value range: min={range_info.get('min')}, max={range_info.get('max')}, step={range_info.get('step')}")
@@ -216,29 +293,51 @@ def run_purchase_flow(
     phone = recipient_phone or os.getenv("RECIPIENT_PHONE")
 
     # Determine amount in INR for guardrail verification
-    try:
-        amount_inr = float(selected_value) if selected_value is not None else float(package_value)
-    except (ValueError, TypeError):
-        amount_inr = 0.0
+    val_to_check = selected_value if selected_value is not None else package_value
+    amount_inr: Optional[float] = None
 
-    print("\n=== Checking Guardrails ===")
-    check_res = guardrails.check_purchase(
-        product=product_id,
-        amount_inr=amount_inr,
-        recipient=phone,
-    )
-    print(f"Guardrails Status: {check_res.status}")
-    print(f"Details: {check_res.reason}")
+    if is_plain_number(val_to_check):
+        amount_inr = float(val_to_check)
+    else:
+        # Parse rupee amount from names like "₹7.47 Talktime Top-Up"
+        rupee_val = parse_rupee_amount(str(val_to_check))
+        if rupee_val is None and selected_package:
+            rupee_val = parse_rupee_amount(str(selected_package.get("name", ""))) or parse_rupee_amount(str(selected_package.get("id", "")))
+        if rupee_val is not None:
+            amount_inr = rupee_val
 
-    if check_res.status == "BLOCKED":
-        raise RuntimeError(f"Purchase blocked by guardrails: {check_res.reason}")
+    def execute_guardrail_check(amt: Any) -> bool:
+        # Never pass a non-numeric value to guardrails.check_purchase
+        try:
+            amt_float = float(amt)
+            if amt_float <= 0:
+                raise ValueError(f"Purchase amount must be positive, got: {amt}")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"Could not determine valid numeric INR amount for guardrail check: {exc}")
 
-    if check_res.status == "NEEDS_APPROVAL":
-        approved = guardrails.ask_approval(check_res.reason)
-        if not approved:
-            print("\nPurchase declined by user. Stopping.")
+        print("\n=== Checking Guardrails ===")
+        res = guardrails.check_purchase(
+            product=product_id,
+            amount_inr=amt_float,
+            recipient=phone,
+        )
+        print(f"Guardrails Status: {res.status}")
+        print(f"Details: {res.reason}")
+
+        if res.status == "BLOCKED":
+            raise RuntimeError(f"Purchase blocked by guardrails: {res.reason}")
+
+        if res.status == "NEEDS_APPROVAL":
+            approved = guardrails.ask_approval(res.reason)
+            if not approved:
+                print("\nPurchase declined by user. Stopping.")
+                return False
+            print("Purchase approved by user. Proceeding...")
+        return True
+
+    if amount_inr is not None:
+        if not execute_guardrail_check(amount_inr):
             return
-        print("Purchase approved by user. Proceeding...")
 
     print("\n=== Step 3: Creating Invoice ===")
     order_item: Dict[str, Any] = {
@@ -275,6 +374,17 @@ def run_purchase_flow(
         print("Invoice Price: N/A")
     print(f"Invoice Status: {invoice.get('status')}")
 
+    # For other packages, convert the package price (sats) to INR using the invoice price
+    if amount_inr is None:
+        pkg_price = selected_package.get("price") if selected_package else price
+        amount_inr = convert_sats_to_inr(
+            price_sats=price if price is not None else pkg_price,
+            package=selected_package,
+            product_details=product_details,
+        )
+        if not execute_guardrail_check(amount_inr):
+            return
+
     if dry_run:
         print("\n[Dry Run] Invoice created successfully. Stopping without paying.")
         return
@@ -299,12 +409,18 @@ def run_purchase_flow(
         elapsed = int(time.time() - start_time)
         print(f"Polling status ({elapsed}s/{int(timeout)}s): invoice='{current_status}', orders={orders_status_summary}")
 
+        if current_status in ("all_error", "blocked", "denied", "payment_error"):
+            raise RuntimeError(f"Invoice {invoice_id} failed with status: {current_status}")
+
+        for o in orders:
+            o_status = o.get("status")
+            if o_status in ("permanent_failure", "refunded", "failed"):
+                o_id = o.get("id")
+                raise RuntimeError(f"Order {o_id} failed with status: {o_status}")
+
         if current_status in ("complete", "delivered") or (orders and all(o.get("status") == "delivered" for o in orders)):
             delivered = True
             break
-
-        if current_status in ("blocked", "denied", "payment_error"):
-            raise RuntimeError(f"Invoice failed with terminal status: {current_status}")
 
     if not delivered:
         raise TimeoutError(f"Invoice {invoice_id} did not reach delivered status within {timeout}s.")
