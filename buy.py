@@ -72,6 +72,28 @@ def get_api_key() -> str:
     )
 
 
+def get_default_recipient_phone() -> Optional[str]:
+    """Retrieve RECIPIENT_PHONE from environment or .env file."""
+    # Check current process environment first
+    phone = os.getenv("RECIPIENT_PHONE")
+    if phone and phone.strip():
+        return phone.strip()
+
+    # Try local .env in current working directory or script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(script_dir, ".env"),
+    ]
+
+    for path in candidates:
+        loaded = load_env_file(path)
+        if "RECIPIENT_PHONE" in loaded and loaded["RECIPIENT_PHONE"].strip():
+            return loaded["RECIPIENT_PHONE"].strip()
+
+    return None
+
+
 def mask_sensitive(value: Optional[str]) -> str:
     """Mask a secret code or PIN while keeping the format discernible."""
     if not value:
@@ -310,7 +332,19 @@ def run_purchase_flow(
 
     vprint(f"\nTarget package selected: ID={selected_package_id}, Value={selected_value}")
 
-    phone = recipient_phone or os.getenv("RECIPIENT_PHONE")
+    # Resolve recipient phone for products requiring a phone number
+    recipient_type = str(product_details.get("recipient_type", "")).strip().lower()
+    if recipient_type == "phone_number":
+        phone = recipient_phone or get_default_recipient_phone()
+        if not phone:
+            raise RuntimeError(
+                f"Recipient phone number is required for product '{product_id}' "
+                f"(recipient_type is 'phone_number'), but none was provided on the command line "
+                f"or in RECIPIENT_PHONE environment variable."
+            )
+        vprint(f"Recipient phone: {mask_text(phone)}")
+    else:
+        phone = recipient_phone
 
     # Determine amount in INR for guardrail verification
     amount_inr: Optional[float] = None
@@ -383,9 +417,9 @@ def run_purchase_flow(
     elif selected_value is not None:
         order_item["value"] = selected_value
 
-    if phone:
+    if recipient_type == "phone_number" or phone:
         order_item["phone_number"] = phone
-        vprint(f"Attached recipient phone: {mask_sensitive(phone)}")
+        vprint(f"Attached recipient phone: {mask_text(phone)}")
 
     invoice = client.create_invoice(
         products_payload=[order_item],
