@@ -1,7 +1,7 @@
 import json
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 import agent
 import buy
@@ -376,5 +376,122 @@ class TestVideoFormatting:
         assert '+91******3210' in captured  # Masked in intent
         assert '[2/4] Validation:' in captured
         assert '987654' not in captured  # Raw unmasked phone never present
+
+
+class TestResilienceAndFallback:
+    @patch('time.sleep')
+    @patch('requests.post')
+    def test_retry_on_429_500_502_503_504(self, mock_post, mock_sleep):
+        resp1 = MagicMock(status_code=429, ok=False)
+        resp2 = MagicMock(status_code=500, ok=False)
+        resp3 = MagicMock(status_code=502, ok=False)
+        resp4 = MagicMock(status_code=200, ok=True)
+        resp4.json.return_value = {
+            'choices': [{
+                'message': {'content': '{"product": "test-gift-card-code", "value": "10", "recipient": "self"}'}
+            }]
+        }
+        mock_post.side_effect = [resp1, resp2, resp3, resp4]
+
+        res = agent.call_llm('groq', 'fake-key', 'Buy test card 10')
+        assert 'test-gift-card-code' in res
+        assert mock_post.call_count == 4
+        assert mock_sleep.call_args_list == [call(1.0), call(2.0), call(4.0)]
+
+    @patch('time.sleep')
+    @patch('requests.post')
+    def test_no_retry_on_400_or_401(self, mock_post, mock_sleep):
+        resp_401 = MagicMock(status_code=401, ok=False, text='Invalid API Key')
+        mock_post.return_value = resp_401
+
+        with pytest.raises(RuntimeError, match='Error \\[401\\]'):
+            agent.call_llm('groq', 'fake-key', 'Buy test card 10')
+
+        assert mock_post.call_count == 1
+        assert not mock_sleep.called
+
+    @patch('time.sleep')
+    @patch('requests.post')
+    def test_gemini_retry_and_exhaustion(self, mock_post, mock_sleep):
+        resp_503 = MagicMock(status_code=503, ok=False, text='Service Unavailable')
+        mock_post.return_value = resp_503
+
+        with pytest.raises(RuntimeError, match='Gemini API Error \\[503\\]'):
+            agent.call_llm('gemini', 'fake-key', 'Buy test card 10')
+
+        assert mock_post.call_count == 4
+        assert mock_sleep.call_args_list == [call(1.0), call(2.0), call(4.0)]
+
+    @patch('time.sleep')
+    @patch('requests.post')
+    def test_gemini_fails_falls_back_to_groq(self, mock_post, mock_sleep):
+        gemini_fail = MagicMock(status_code=500, ok=False, text='Gemini Server Error')
+        groq_success = MagicMock(status_code=200, ok=True)
+        groq_success.json.return_value = {
+            'choices': [{
+                'message': {'content': '{"product": "reliance-jio-india-bundles", "value": "19", "recipient": "+919876543210"}'}
+            }]
+        }
+        mock_post.side_effect = [gemini_fail, gemini_fail, gemini_fail, gemini_fail, groq_success]
+
+        providers = [('gemini', 'gem-key'), ('groq', 'groq-key')]
+        parsed = agent.extract_intent_with_fallback('Recharge Jio 19', providers=providers)
+
+        assert parsed == {
+            'product': 'reliance-jio-india-bundles',
+            'value': '19',
+            'recipient': '+919876543210',
+        }
+        assert mock_post.call_count == 5
+
+    @patch('time.sleep')
+    @patch('requests.post')
+    def test_all_providers_fail_returns_none(self, mock_post, mock_sleep):
+        gemini_fail = MagicMock(status_code=500, ok=False, text='Server Error')
+        groq_fail = MagicMock(status_code=429, ok=False, text='Rate limited')
+        openrouter_fail = MagicMock(status_code=504, ok=False, text='Gateway timeout')
+
+        mock_post.side_effect = [gemini_fail] * 4 + [groq_fail] * 4 + [openrouter_fail] * 4
+
+        providers = [('gemini', 'k1'), ('groq', 'k2'), ('openrouter', 'k3')]
+        result = agent.extract_intent_with_fallback('Buy test card 10', providers=providers)
+
+        assert result is None
+        assert mock_post.call_count == 12
+
+    @patch('agent.extract_intent_with_fallback', return_value=None)
+    @patch('agent.get_llm_credentials', return_value=('gemini', 'fake-key'))
+    @patch('agent.get_all_llm_credentials', return_value=[('gemini', 'fake-key'), ('groq', 'fake-key-2')])
+    @patch('builtins.input', side_effect=['Buy test card 10', 'exit'])
+    @patch('buy.run_purchase_flow')
+    def test_run_agent_loop_all_providers_fail_prints_message_and_waits(
+        self, mock_buy_flow, mock_input, mock_all_creds, mock_creds, mock_extract, capsys
+    ):
+        agent.run_agent_loop(dry_run=True)
+        captured = capsys.readouterr().out
+
+        assert 'LLM unavailable, nothing was bought' in captured
+        assert not mock_buy_flow.called
+
+    @patch('requests.post')
+    def test_temperature_is_zero(self, mock_post):
+        mock_response = MagicMock(ok=True)
+        mock_response.json.return_value = {
+            'choices': [{'message': {'content': '{"product": "test-gift-card-code", "value": "10", "recipient": "self"}'}}]
+        }
+        mock_post.return_value = mock_response
+
+        # Check Groq payload
+        agent.call_llm('groq', 'key', 'prompt')
+        payload = mock_post.call_args.kwargs['json']
+        assert payload['temperature'] == 0.0
+
+        # Check Gemini payload
+        mock_response.json.return_value = {
+            'candidates': [{'content': {'parts': [{'text': '{"product": "test-gift-card-code", "value": "10", "recipient": "self"}'}]}}]
+        }
+        agent.call_llm('gemini', 'key', 'prompt')
+        gemini_payload = mock_post.call_args.kwargs['json']
+        assert gemini_payload['generationConfig']['temperature'] == 0.0
 
 

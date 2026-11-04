@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 
@@ -94,12 +95,15 @@ GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/mod
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_BACKOFFS = [1.0, 2.0, 4.0]
 
-def get_llm_credentials() -> Tuple[str, str]:
+
+def get_all_llm_credentials() -> List[Tuple[str, str]]:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(os.getcwd(), ".env"),
@@ -111,18 +115,30 @@ def get_llm_credentials() -> Tuple[str, str]:
         loaded = buy.load_env_file(path)
         loaded_env.update(loaded)
 
-    # Provider Priority: 1. Gemini, 2. Groq, 3. OpenRouter
+    providers: List[Tuple[str, str]] = []
+
+    # Priority 1: Gemini
     gemini_key = os.getenv("GEMINI_API_KEY") or loaded_env.get("GEMINI_API_KEY")
     if gemini_key and gemini_key.strip():
-        return "gemini", gemini_key.strip()
+        providers.append(("gemini", gemini_key.strip()))
 
+    # Priority 2: Groq
     groq_key = os.getenv("GROQ_API_KEY") or loaded_env.get("GROQ_API_KEY")
     if groq_key and groq_key.strip():
-        return "groq", groq_key.strip()
+        providers.append(("groq", groq_key.strip()))
 
+    # Priority 3: OpenRouter
     openrouter_key = os.getenv("OPENROUTER_API_KEY") or loaded_env.get("OPENROUTER_API_KEY")
     if openrouter_key and openrouter_key.strip():
-        return "openrouter", openrouter_key.strip()
+        providers.append(("openrouter", openrouter_key.strip()))
+
+    return providers
+
+
+def get_llm_credentials() -> Tuple[str, str]:
+    providers = get_all_llm_credentials()
+    if providers:
+        return providers[0]
 
     raise RuntimeError(
         "No LLM API key found (GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY). "
@@ -258,6 +274,51 @@ def call_llm(
         "Do NOT return any commentary, markdown explanation, or text outside the JSON object."
     )
 
+def _send_request_with_retry(
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: float = 30.0,
+    backoffs: Optional[List[float]] = None,
+) -> requests.Response:
+    delays = DEFAULT_BACKOFFS if backoffs is None else backoffs
+    max_retries = len(delays)
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            if attempt < max_retries:
+                time.sleep(delays[attempt])
+                continue
+            safe_err = buy.mask_text(str(exc))
+            raise RuntimeError(f"Network error calling LLM: {safe_err}")
+
+        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+            time.sleep(delays[attempt])
+            continue
+
+        return resp
+
+    return resp
+
+
+def call_llm(
+    provider: str,
+    api_key: str,
+    user_prompt: str,
+    timeout: float = 30.0,
+    backoffs: Optional[List[float]] = None,
+) -> str:
+    system_instruction = (
+        "You are an assistant that extracts purchase intent from user messages.\n"
+        "You must respond ONLY with a single valid JSON object containing exactly three keys:\n"
+        '  - "product": one of ["reliance-jio-india-bundles", "airtel-india", "test-gift-card-code"]\n'
+        '  - "value": package amount or value as a numeric string (e.g. "10", "20", "50", "500", "1000")\n'
+        '  - "recipient": phone number matching +91 followed by 10 digits (e.g. "+919876543210") or "self"\n'
+        "Do NOT return any commentary, markdown explanation, or text outside the JSON object."
+    )
+
     if provider == "gemini":
         model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         url = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
@@ -278,7 +339,7 @@ def call_llm(
             },
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp = _send_request_with_retry(url, headers=headers, payload=payload, timeout=timeout, backoffs=backoffs)
         if not resp.ok:
             safe_err = buy.mask_text(resp.text)
             raise RuntimeError(f"Gemini API Error [{resp.status_code}]: {safe_err}")
@@ -313,7 +374,7 @@ def call_llm(
         "response_format": {"type": "json_object"},
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp = _send_request_with_retry(url, headers=headers, payload=payload, timeout=timeout, backoffs=backoffs)
     if not resp.ok:
         safe_err = buy.mask_text(resp.text)
         raise RuntimeError(f"LLM API Error [{resp.status_code}]: {safe_err}")
@@ -324,6 +385,50 @@ def call_llm(
         raise RuntimeError("LLM returned empty choices list.")
 
     return choices[0].get("message", {}).get("content", "").strip()
+
+
+def extract_intent_with_fallback(
+    user_prompt: str,
+    providers: Optional[List[Tuple[str, str]]] = None,
+    timeout: float = 30.0,
+    backoffs: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Extract purchase intent using configured providers in priority order.
+    Retries each provider up to 3 times on HTTP 429, 500, 502, 503, 504.
+    If Gemini (or current provider) fails, falls back to GROQ or OPENROUTER.
+    Returns parsed JSON dict, or None if every provider fails.
+    """
+    if providers is None:
+        try:
+            p, k = get_llm_credentials()
+            providers = [(p, k)]
+            all_p = get_all_llm_credentials()
+            for item in all_p:
+                if item[0] != p:
+                    providers.append(item)
+        except Exception:
+            providers = []
+
+    if not providers:
+        return None
+
+    for provider, api_key in providers:
+        try:
+            raw_output = call_llm(
+                provider=provider,
+                api_key=api_key,
+                user_prompt=user_prompt,
+                timeout=timeout,
+                backoffs=backoffs,
+            )
+            parsed = parse_llm_json(raw_output)
+            return parsed
+        except Exception:
+            # Fall back to next provider
+            continue
+
+    return None
 
 
 def parse_llm_json(raw_text: str) -> Dict[str, Any]:
@@ -429,7 +534,12 @@ def run_agent_loop(dry_run: bool = False) -> None:
     # 1. Load LLM credentials
     try:
         provider, api_key = get_llm_credentials()
-        print(f"LLM Provider: {provider.upper()} (API key loaded successfully)")
+        all_creds = get_all_llm_credentials()
+        configured_providers = [(provider, api_key)] + [
+            (p, k) for p, k in all_creds if p != provider
+        ]
+        chain_str = " -> ".join(p[0].upper() for p in configured_providers)
+        print(f"LLM Provider: {provider.upper()} (Configured chain: {chain_str})")
     except Exception as exc:
         print(
             f"\nConfiguration Error: {exc}\n"
@@ -466,12 +576,11 @@ def run_agent_loop(dry_run: bool = False) -> None:
             print("Goodbye!")
             break
 
-        # Step 1: Parse Intent with LLM
-        try:
-            raw_llm_output = call_llm(provider, api_key, user_input)
-            parsed_json = parse_llm_json(raw_llm_output)
-        except Exception as exc:
-            print(f"[1/4] Parse Intent:     {STATUS_BLOCKED}  (Error: {mask_text(str(exc))})")
+        # Step 1: Parse Intent with LLM (retries on 429/500/502/503/504 and falls back to other providers)
+        parsed_json = extract_intent_with_fallback(user_input, configured_providers)
+        if parsed_json is None:
+            print(f"[1/4] Parse Intent:     {STATUS_BLOCKED}  (LLM unavailable, nothing was bought)")
+            print("LLM unavailable, nothing was bought")
             continue
 
         raw_prod = parsed_json.get("product", "")
