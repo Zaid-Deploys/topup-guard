@@ -4,3 +4,4 @@ __pycache__/
 receipts/
 .venv/
 ledger.json
+.vscode/
