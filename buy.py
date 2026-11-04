@@ -83,6 +83,28 @@ def mask_sensitive(value: Optional[str]) -> str:
     return f"{val_str[:2]}{'*' * (len(val_str) - 4)}{val_str[-2:]}"
 
 
+def mask_text(text: Any) -> str:
+    """Mask any phone numbers in string."""
+    if not text:
+        return ""
+    s = str(text)
+    s = re.sub(r'(\+91)\d{6}(\d{4})', r'\1******\2', s)
+    s = re.sub(r'(?<!\d)([6-9])\d{5}(\d{4})(?!\d)', r'\1*****\2', s)
+    return s
+
+
+COLOR_RESET = "\033[0m"
+COLOR_GREEN = "\033[1;32m"
+COLOR_RED = "\033[1;31m"
+COLOR_YELLOW = "\033[1;33m"
+COLOR_BRIGHT_GREEN = "\033[1;92m"
+
+STATUS_OK = f"{COLOR_GREEN}OK{COLOR_RESET}"
+STATUS_BLOCKED = f"{COLOR_RED}BLOCKED{COLOR_RESET}"
+STATUS_APPROVAL_NEEDED = f"{COLOR_YELLOW}APPROVAL NEEDED{COLOR_RESET}"
+STATUS_DELIVERED = f"{COLOR_BRIGHT_GREEN}DELIVERED{COLOR_RESET}"
+
+
 def is_plain_number(val: Any) -> bool:
     """Check if value is a plain numeric string or number."""
     if val is None:
@@ -111,8 +133,15 @@ def parse_rupee_amount(text: Optional[str]) -> Optional[float]:
     return None
 
 
-def get_sats_per_inr_rate(product_details: Optional[Dict[str, Any]]) -> float:
-    """Derive sats-per-INR exchange rate from available packages in product."""
+_CACHED_SATS_PER_INR_RATE: Optional[float] = None
+
+
+def get_sats_per_inr_rate(product_details: Optional[Dict[str, Any]] = None) -> float:
+    """Derive sats-per-INR exchange rate from available packages in product (fetched once)."""
+    global _CACHED_SATS_PER_INR_RATE
+    if _CACHED_SATS_PER_INR_RATE is not None:
+        return _CACHED_SATS_PER_INR_RATE
+
     if product_details:
         packages = product_details.get("packages", [])
         rates: List[float] = []
@@ -129,32 +158,20 @@ def get_sats_per_inr_rate(product_details: Optional[Dict[str, Any]]) -> float:
             except (ValueError, TypeError):
                 continue
         if rates:
-            return sum(rates) / len(rates)
-    return 14.03
+            _CACHED_SATS_PER_INR_RATE = sum(rates) / len(rates)
+            return _CACHED_SATS_PER_INR_RATE
+
+    _CACHED_SATS_PER_INR_RATE = 14.03
+    return _CACHED_SATS_PER_INR_RATE
 
 
 def convert_sats_to_inr(
     price_sats: float,
-    package: Optional[Dict[str, Any]] = None,
     product_details: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """Convert sats to INR using package price/amount or product rate."""
-    sats = float(price_sats)
-    if package:
-        pkg_amt = package.get("amount")
-        pkg_prc = package.get("price")
-        if pkg_amt and pkg_prc:
-            try:
-                amt_f = float(pkg_amt)
-                prc_f = float(pkg_prc)
-                if amt_f > 0 and prc_f > 0:
-                    rate = prc_f / amt_f
-                    return round(sats / rate, 2)
-            except (ValueError, TypeError):
-                pass
-
+    """Convert sats to INR using a rate fetched once."""
     rate = get_sats_per_inr_rate(product_details)
-    return round(sats / rate, 2)
+    return round(float(price_sats) / rate, 2)
 
 
 class BitrefillClient:
@@ -229,12 +246,14 @@ def run_purchase_flow(
     recipient_phone: Optional[str] = None,
     dry_run: bool = False,
     timeout: float = POLL_TIMEOUT_SECONDS,
+    verbose: bool = True,
 ):
+    vprint = print if verbose else lambda *args, **kwargs: None
     api_key = get_api_key()
     client = BitrefillClient(api_key=api_key)
 
-    print("=== Step 1: Searching Product ===")
-    print(f"Searching for '{product_id}' in country '{country}'...")
+    vprint("=== Step 1: Searching Product ===")
+    vprint(f"Searching for '{product_id}' in country '{country}'...")
     search_results = client.search_products(query=product_id)
 
     matched_product = None
@@ -246,100 +265,115 @@ def run_purchase_flow(
             break
 
     if matched_product:
-        print(f"Found product in search: {matched_product.get('name')} (ID: {matched_product.get('id')})")
+        vprint(f"Found product in search: {matched_product.get('name')} (ID: {matched_product.get('id')})")
     else:
-        print(f"Product '{product_id}' not explicitly found in search query results, querying direct product endpoint...")
+        vprint(f"Product '{product_id}' not explicitly found in search query results, querying direct product endpoint...")
 
-    print("\n=== Step 2: Getting Package Values ===")
+    vprint("\n=== Step 2: Getting Package Values ===")
     product_details = client.get_product(product_id)
     packages: List[Dict[str, Any]] = product_details.get("packages", [])
     range_info = product_details.get("range")
 
-    print(f"Product Name: {product_details.get('name')}")
-    print(f"Product Currency: {product_details.get('currency')}")
+    vprint(f"Product Name: {product_details.get('name')}")
+    vprint(f"Product Currency: {product_details.get('currency')}")
 
     selected_package_id = None
     selected_value = None
     selected_package: Optional[Dict[str, Any]] = None
 
     if packages:
-        print(f"Available Packages ({len(packages)} total):")
+        vprint(f"Available Packages ({len(packages)} total):")
         for pkg in packages:
             pkg_id = pkg.get("package_id") or pkg.get("id")
             val = str(pkg.get("value"))
             price = pkg.get("price")
-            print(f"  - Package ID: {pkg_id} | Value: {val} | Price: {price}")
+            vprint(f"  - Package ID: {pkg_id} | Value: {val} | Price: {price}")
 
-            # Match the package value exactly
-            if val == str(package_value) and selected_package_id is None:
+            # Match the package value exactly or by amount denomination
+            pkg_amt = str(pkg.get("amount")) if pkg.get("amount") is not None else ""
+            if (val == str(package_value) or pkg_amt == str(package_value)) and selected_package_id is None:
                 selected_package_id = pkg_id
                 selected_value = pkg.get("value")
                 selected_package = pkg
 
     if not selected_package_id and range_info:
-        print(f"Product offers a value range: min={range_info.get('min')}, max={range_info.get('max')}, step={range_info.get('step')}")
+        vprint(f"Product offers a value range: min={range_info.get('min')}, max={range_info.get('max')}, step={range_info.get('step')}")
         val_float = float(package_value)
         if range_info.get("min", 0) <= val_float <= range_info.get("max", float("inf")):
             selected_value = val_float
-            print(f"Selected range value: {selected_value}")
+            vprint(f"Selected range value: {selected_value}")
 
     if not selected_package_id and selected_value is None:
         raise RuntimeError(
             f"Could not find a package matching value '{package_value}' for product '{product_id}'."
         )
 
-    print(f"\nTarget package selected: ID={selected_package_id}, Value={selected_value}")
+    vprint(f"\nTarget package selected: ID={selected_package_id}, Value={selected_value}")
 
     phone = recipient_phone or os.getenv("RECIPIENT_PHONE")
 
     # Determine amount in INR for guardrail verification
-    val_to_check = selected_value if selected_value is not None else package_value
     amount_inr: Optional[float] = None
 
-    if is_plain_number(val_to_check):
-        amount_inr = float(val_to_check)
+    if selected_package and is_plain_number(selected_package.get("amount")):
+        amount_inr = float(selected_package["amount"])
+    elif is_plain_number(package_value):
+        amount_inr = float(package_value)
     else:
-        # Parse rupee amount from names like "₹7.47 Talktime Top-Up"
-        rupee_val = parse_rupee_amount(str(val_to_check))
-        if rupee_val is None and selected_package:
-            rupee_val = parse_rupee_amount(str(selected_package.get("name", ""))) or parse_rupee_amount(str(selected_package.get("id", "")))
-        if rupee_val is not None:
-            amount_inr = rupee_val
+        val_to_check = selected_value if selected_value is not None else package_value
+        if is_plain_number(val_to_check):
+            amount_inr = float(val_to_check)
+        else:
+            # Parse rupee amount from names like "₹7.47 Talktime Top-Up"
+            rupee_val = parse_rupee_amount(str(val_to_check))
+            if rupee_val is None and selected_package:
+                rupee_val = parse_rupee_amount(str(selected_package.get("name", ""))) or parse_rupee_amount(str(selected_package.get("id", "")))
+            if rupee_val is not None:
+                amount_inr = rupee_val
+            elif selected_package and selected_package.get("price") is not None:
+                # For packages whose name has no ₹ amount, get INR amount from catalog price
+                try:
+                    catalog_price_sats = float(selected_package["price"])
+                    if catalog_price_sats > 0:
+                        amount_inr = convert_sats_to_inr(catalog_price_sats, product_details)
+                except (ValueError, TypeError):
+                    pass
 
-    def execute_guardrail_check(amt: Any) -> bool:
-        # Never pass a non-numeric value to guardrails.check_purchase
-        try:
-            amt_float = float(amt)
-            if amt_float <= 0:
-                raise ValueError(f"Purchase amount must be positive, got: {amt}")
-        except (ValueError, TypeError) as exc:
-            raise RuntimeError(f"Could not determine valid numeric INR amount for guardrail check: {exc}")
+    if amount_inr is None or amount_inr <= 0:
+        raise RuntimeError(f"Could not determine INR amount for package '{val_to_check}'.")
 
-        print("\n=== Checking Guardrails ===")
-        res = guardrails.check_purchase(
-            product=product_id,
-            amount_inr=amt_float,
-            recipient=phone,
-        )
-        print(f"Guardrails Status: {res.status}")
-        print(f"Details: {res.reason}")
+    # Guardrail check must run BEFORE invoice is created
+    vprint("\n=== Checking Guardrails ===")
+    check_res = guardrails.check_purchase(
+        product=product_id,
+        amount_inr=amount_inr,
+        recipient=phone,
+    )
+    vprint(f"Guardrails Status: {check_res.status}")
+    vprint(f"Details: {check_res.reason}")
 
-        if res.status == "BLOCKED":
-            raise RuntimeError(f"Purchase blocked by guardrails: {res.reason}")
+    if check_res.status == "BLOCKED":
+        masked_reason = mask_text(check_res.reason)
+        if not verbose:
+            print(f"[3/4] Guardrails:       {STATUS_BLOCKED}  ({masked_reason})")
+        raise RuntimeError(f"Purchase blocked by guardrails: {masked_reason}")
 
-        if res.status == "NEEDS_APPROVAL":
-            approved = guardrails.ask_approval(res.reason)
-            if not approved:
-                print("\nPurchase declined by user. Stopping.")
-                return False
-            print("Purchase approved by user. Proceeding...")
-        return True
+    if check_res.status == "NEEDS_APPROVAL":
+        masked_reason = mask_text(check_res.reason)
+        if not verbose:
+            print(f"[3/4] Guardrails:       {STATUS_APPROVAL_NEEDED}  ({masked_reason})")
+        approved = guardrails.ask_approval(masked_reason)
+        if not approved:
+            print("[Declined] Purchase declined by user.")
+            return None
+        vprint("Purchase approved by user. Proceeding...")
+    else:
+        if not verbose:
+            today_spent = guardrails.get_daily_spending()
+            max_day = guardrails.get_max_per_day()
+            print(f"[3/4] Guardrails:       {STATUS_OK}  (Today's spend: ₹{today_spent:.2f} / ₹{max_day:.2f} INR)")
 
-    if amount_inr is not None:
-        if not execute_guardrail_check(amount_inr):
-            return
-
-    print("\n=== Step 3: Creating Invoice ===")
+    vprint("\n=== Step 3: Creating Invoice ===")
     order_item: Dict[str, Any] = {
         "product_id": product_id,
         "quantity": 1,
@@ -351,7 +385,7 @@ def run_purchase_flow(
 
     if phone:
         order_item["phone_number"] = phone
-        print(f"Attached recipient phone: {mask_sensitive(phone)}")
+        vprint(f"Attached recipient phone: {mask_sensitive(phone)}")
 
     invoice = client.create_invoice(
         products_payload=[order_item],
@@ -365,36 +399,37 @@ def run_purchase_flow(
     if currency and currency.upper() in ("BTC", "XBT"):
         currency = "sats"
 
-    print(f"Invoice successfully created!")
-    print(f"Invoice ID: {invoice_id}")
+    vprint(f"Invoice successfully created!")
+    vprint(f"Invoice ID: {invoice_id}")
     if price is not None:
         price_str = f"{price} {currency}".strip() if currency else str(price)
-        print(f"Invoice Price: {price_str}")
+        vprint(f"Invoice Price: {price_str}")
     else:
-        print("Invoice Price: N/A")
-    print(f"Invoice Status: {invoice.get('status')}")
-
-    # For other packages, convert the package price (sats) to INR using the invoice price
-    if amount_inr is None:
-        pkg_price = selected_package.get("price") if selected_package else price
-        amount_inr = convert_sats_to_inr(
-            price_sats=price if price is not None else pkg_price,
-            package=selected_package,
-            product_details=product_details,
-        )
-        if not execute_guardrail_check(amount_inr):
-            return
+        vprint("Invoice Price: N/A")
+    vprint(f"Invoice Status: {invoice.get('status')}")
 
     if dry_run:
-        print("\n[Dry Run] Invoice created successfully. Stopping without paying.")
-        return
+        if not verbose:
+            print(f"[4/4] Delivery:         {STATUS_OK}  (Dry-Run: Invoice {invoice_id} created)")
+        else:
+            print("\n[Dry Run] Invoice created successfully. Stopping without paying.")
+        return {
+            "invoice_id": invoice_id,
+            "status": invoice.get("status"),
+            "product_id": product_id,
+            "package_value": package_value,
+            "amount_inr": amount_inr,
+            "recipient": phone,
+            "dry_run": True,
+            "invoice": invoice,
+        }
 
-    print("\n=== Step 4: Paying Invoice from Account Balance ===")
+    vprint("\n=== Step 4: Paying Invoice from Account Balance ===")
     pay_res = client.pay_invoice(invoice_id)
-    print(f"Payment request submitted for invoice: {invoice_id}")
-    print(f"Updated Invoice Status: {pay_res.get('status')}")
+    vprint(f"Payment request submitted for invoice: {invoice_id}")
+    vprint(f"Updated Invoice Status: {pay_res.get('status')}")
 
-    print("\n=== Step 5: Polling Invoice until Delivered ===")
+    vprint("\n=== Step 5: Polling Invoice until Delivered ===")
     start_time = time.time()
     delivered = False
     latest_invoice = pay_res
@@ -407,7 +442,7 @@ def run_purchase_flow(
 
         orders_status_summary = [o.get("status") for o in orders]
         elapsed = int(time.time() - start_time)
-        print(f"Polling status ({elapsed}s/{int(timeout)}s): invoice='{current_status}', orders={orders_status_summary}")
+        vprint(f"Polling status ({elapsed}s/{int(timeout)}s): invoice='{current_status}', orders={orders_status_summary}")
 
         if current_status in ("all_error", "blocked", "denied", "payment_error"):
             raise RuntimeError(f"Invoice {invoice_id} failed with status: {current_status}")
@@ -425,9 +460,9 @@ def run_purchase_flow(
     if not delivered:
         raise TimeoutError(f"Invoice {invoice_id} did not reach delivered status within {timeout}s.")
 
-    print("\n=== Step 6: Order Summary & Delivery Details ===")
-    print(f"Invoice ID: {invoice_id}")
-    print(f"Final Invoice Status: {latest_invoice.get('status')}")
+    vprint("\n=== Step 6: Order Summary & Delivery Details ===")
+    vprint(f"Invoice ID: {invoice_id}")
+    vprint(f"Final Invoice Status: {latest_invoice.get('status')}")
 
     orders = latest_invoice.get("orders", [])
     for order_summary in orders:
@@ -435,11 +470,11 @@ def run_purchase_flow(
         try:
             order_data = client.get_order(order_id)
         except Exception as e:
-            print(f"Notice: Could not fetch detailed order {order_id} ({e}), using invoice summary.")
+            vprint(f"Notice: Could not fetch detailed order {order_id} ({e}), using invoice summary.")
             order_data = order_summary
 
-        print(f"\nOrder ID: {order_id}")
-        print(f"Order Status: {order_data.get('status')}")
+        vprint(f"\nOrder ID: {order_id}")
+        vprint(f"Order Status: {order_data.get('status')}")
 
         redemption_info = order_data.get("redemption_info")
         if isinstance(redemption_info, dict):
@@ -449,17 +484,17 @@ def run_purchase_flow(
             instructions = redemption_info.get("instructions")
 
             if code:
-                print(f"Redemption Code: {mask_sensitive(code)}")
+                vprint(f"Redemption Code: {mask_sensitive(code)}")
             if pin:
-                print(f"Redemption PIN: {mask_sensitive(pin)}")
+                vprint(f"Redemption PIN: {mask_sensitive(pin)}")
             if link:
-                print(f"Redemption Link: {link}")
+                vprint(f"Redemption Link: {link}")
             if instructions:
-                print(f"Instructions: {instructions}")
+                vprint(f"Instructions: {instructions}")
         elif isinstance(redemption_info, str) and redemption_info:
-            print(f"Redemption Info: {mask_sensitive(redemption_info)}")
+            vprint(f"Redemption Info: {mask_sensitive(redemption_info)}")
         else:
-            print("Redemption Info: Delivered directly (no voucher code required).")
+            vprint("Redemption Info: Delivered directly (no voucher code required).")
 
     # Record purchase in ledger after delivery
     ledger_entry = guardrails.record_purchase(
@@ -468,7 +503,22 @@ def run_purchase_flow(
         recipient=phone,
         invoice_id=invoice_id,
     )
-    print(f"\n[Guardrails] Purchase recorded in ledger: {ledger_entry['purchase_key']}")
+    vprint(f"\n[Guardrails] Purchase recorded in ledger: {ledger_entry['purchase_key']}")
+
+    if not verbose:
+        print(f"[4/4] Delivery:         {STATUS_DELIVERED}  (Invoice ID: {invoice_id})")
+
+    return {
+        "invoice_id": invoice_id,
+        "status": latest_invoice.get("status"),
+        "product_id": product_id,
+        "package_value": package_value,
+        "amount_inr": amount_inr,
+        "recipient": phone,
+        "invoice": latest_invoice,
+        "orders": orders,
+        "ledger_entry": ledger_entry,
+    }
 
 
 if __name__ == "__main__":
